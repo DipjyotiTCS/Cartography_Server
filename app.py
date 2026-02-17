@@ -22,6 +22,8 @@ from services.embeddings import embed_texts
 from services.faiss_store import FaissStore
 from services.neo4j_service import Neo4jService
 from services.diff_service import make_class_diff, make_method_diff
+from services.workitem_extractor import parse_workitems_from_dir
+from services.workitem_mapper import match_workitem_to_docs
 from pathlib import Path
 
 class IngestRequest(BaseModel):
@@ -29,6 +31,11 @@ class IngestRequest(BaseModel):
     repo_link: str = Field(min_length=5)
     language: str = Field(min_length=1)
 
+
+class WorkItemProcessRequest(BaseModel):
+    repo_name: str = Field(min_length=1)
+    threshold: float = Field(default=0.18, ge=0.0, le=1.0)
+    top_k: int = Field(default=5, ge=1, le=50)
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -316,6 +323,97 @@ def create_app() -> Flask:
         finally:
             neo.close()
 
+
+@app.post("/api/workitems/process")
+def process_workitems():
+    """Extract WorkItems from /workitem PDFs of a previously ingested repo and map them to existing code nodes.
+
+    Mapping is performed across ALL existing JavaClass/JavaMethod nodes in Neo4j (irrespective of repository).
+    """
+    try:
+        payload = WorkItemProcessRequest(**request.get_json(force=True))
+    except ValidationError as e:
+        return jsonify({"error": "invalid_payload", "details": json.loads(e.json())}), 400
+
+    repo = get_repo_by_name(cfg.SQLITE_PATH, payload.repo_name)
+    if not repo:
+        return jsonify({
+            "error": "repo_not_found",
+            "details": "Repo name not found in SQLite. Ingest the repo first using /api/repos/ingest.",
+            "repo_name": payload.repo_name
+        }), 400
+
+    local_path = repo.get("local_path") or ""
+    workitem_dir = os.path.join(local_path, "workitem")
+
+    # 1) Extract workitems from PDFs
+    workitems = parse_workitems_from_dir(workitem_dir)
+
+    counts = {
+        "repo_name": payload.repo_name,
+        "workitem_dir": workitem_dir,
+        "pdf_workitems_extracted": len(workitems),
+        "workitems_upserted": 0,
+        "links_created": 0,
+        "matched_class_links": 0,
+        "matched_method_links": 0,
+        "workitems_without_matches": 0,
+    }
+
+    neo = Neo4jService(cfg.NEO4J_URI, cfg.NEO4J_USER, cfg.NEO4J_PASSWORD)
+    try:
+        neo.ensure_constraints()
+
+        class_docs = neo.get_all_class_docs()
+        method_docs = neo.get_all_method_docs()
+
+        for wi in workitems:
+            wid = neo.upsert_workitem({
+                "key": wi.key,
+                "title": wi.title,
+                "description": wi.description,
+                "acceptance_criteria": wi.acceptance_criteria,
+                "source_pdf": wi.source_pdf,
+            })
+            counts["workitems_upserted"] += 1
+
+            matches = match_workitem_to_docs(
+                wi,
+                class_docs=class_docs,
+                method_docs=method_docs,
+                threshold=float(payload.threshold),
+                top_k=int(payload.top_k),
+            )
+
+            if not matches:
+                counts["workitems_without_matches"] += 1
+                continue
+
+            for m in matches:
+                if m.node_type == "class":
+                    neo.link_workitem_to_class(
+                        workitem_id=wid,
+                        project_name=m.node_key.get("project_name"),
+                        package=m.node_key.get("package") or "",
+                        class_name=m.node_key.get("class_name"),
+                        score=m.score,
+                    )
+                    counts["links_created"] += 1
+                    counts["matched_class_links"] += 1
+                elif m.node_type == "method":
+                    neo.link_workitem_to_method(
+                        workitem_id=wid,
+                        project_name=m.node_key.get("project_name"),
+                        class_name=m.node_key.get("class_name"),
+                        signature=m.node_key.get("signature"),
+                        score=m.score,
+                    )
+                    counts["links_created"] += 1
+                    counts["matched_method_links"] += 1
+
+        return jsonify({"status": "completed", "counts": counts}), 200
+    finally:
+        neo.close()
     return app
 
 if __name__ == "__main__":

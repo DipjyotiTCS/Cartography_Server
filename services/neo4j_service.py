@@ -21,6 +21,7 @@ class Neo4jService:
             "CREATE CONSTRAINT diffindex_id IF NOT EXISTS FOR (x:DiffIndex) REQUIRE x.diff_index_id IS UNIQUE",
             # DiffEntry is uniquely identified by the pair of file paths + diff hash.
             "CREATE CONSTRAINT diffentry_key IF NOT EXISTS FOR (d:DiffEntry) REQUIRE (d.diff_hash, d.left_file_path, d.right_file_path) IS UNIQUE",
+            "CREATE CONSTRAINT workitem_id IF NOT EXISTS FOR (w:WorkItem) REQUIRE w.workitem_id IS UNIQUE",
         ]
         with self.driver.session() as s:
             for c in cyphers:
@@ -254,3 +255,89 @@ class Neo4jService:
                   right_method=rm,
                   diff=difference,
             )
+
+
+# -------------------------
+# WorkItems
+# -------------------------
+def upsert_workitem(self, workitem: Dict[str, Any]) -> str:
+    """Create/merge a WorkItem node and return its workitem_id."""
+    # Prefer explicit id; otherwise derive from key+title+source_pdf
+    wid = workitem.get("workitem_id")
+    if not wid:
+        raw = f'{workitem.get("key","")}::{workitem.get("title","")}::{workitem.get("source_pdf","")}'
+        wid = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    q = """
+    MERGE (w:WorkItem {workitem_id: $workitem_id})
+    SET w.key = $key,
+        w.title = $title,
+        w.description = $description,
+        w.acceptance_criteria = $acceptance_criteria,
+        w.source_pdf = $source_pdf,
+        w.updated_at = datetime(),
+        w.created_at = coalesce(w.created_at, datetime())
+    RETURN w.workitem_id AS workitem_id
+    """
+    with self.driver.session() as s:
+        rec = s.run(
+            q,
+            workitem_id=wid,
+            key=workitem.get("key",""),
+            title=workitem.get("title",""),
+            description=workitem.get("description",""),
+            acceptance_criteria=workitem.get("acceptance_criteria",""),
+            source_pdf=workitem.get("source_pdf",""),
+        ).single()
+        return rec["workitem_id"] if rec else wid
+
+def link_workitem_to_class(self, workitem_id: str, project_name: str, package: str, class_name: str, score: float) -> None:
+    q = """
+    MATCH (w:WorkItem {workitem_id: $workitem_id})
+    MATCH (c:JavaClass {project_name: $project_name, package: $package, class_name: $class_name})
+    MERGE (w)-[r:BASED_ON]->(c)
+    SET r.score = $score,
+        r.updated_at = datetime(),
+        r.created_at = coalesce(r.created_at, datetime())
+    """
+    with self.driver.session() as s:
+        s.run(q, workitem_id=workitem_id, project_name=project_name, package=package or "", class_name=class_name, score=float(score))
+
+def link_workitem_to_method(self, workitem_id: str, project_name: str, class_name: str, signature: str, score: float) -> None:
+    q = """
+    MATCH (w:WorkItem {workitem_id: $workitem_id})
+    MATCH (m:JavaMethod {project_name: $project_name, class_name: $class_name, signature: $signature})
+    MERGE (w)-[r:BASED_ON]->(m)
+    SET r.score = $score,
+        r.updated_at = datetime(),
+        r.created_at = coalesce(r.created_at, datetime())
+    """
+    with self.driver.session() as s:
+        s.run(q, workitem_id=workitem_id, project_name=project_name, class_name=class_name, signature=signature, score=float(score))
+
+def get_all_class_docs(self) -> List[Dict[str, Any]]:
+    """Return all class-linked (file) documentation text across all projects."""
+    q = """
+    MATCH (c:JavaClass)-[:HAS_FILE_DOC]->(d:Documentation)
+    RETURN d.doc_id AS doc_id,
+           d.text AS text,
+           c.project_name AS project_name,
+           c.package AS package,
+           c.class_name AS class_name
+    """
+    with self.driver.session() as s:
+        res = s.run(q)
+        return [dict(r) for r in res]
+
+def get_all_method_docs(self) -> List[Dict[str, Any]]:
+    """Return all method-linked documentation text across all projects."""
+    q = """
+    MATCH (m:JavaMethod)-[:HAS_METHOD_DOC]->(d:Documentation)
+    RETURN d.doc_id AS doc_id,
+           d.text AS text,
+           m.project_name AS project_name,
+           m.class_name AS class_name,
+           m.signature AS signature
+    """
+    with self.driver.session() as s:
+        res = s.run(q)
+        return [dict(r) for r in res]
