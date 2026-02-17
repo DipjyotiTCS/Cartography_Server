@@ -8,10 +8,12 @@ import json
 import hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any
+from pathlib import Path
 
 from flask import Flask, request, jsonify
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from config import Config
 from services.db import ensure_db, get_repo_by_name, upsert_repo, insert_ingest_error, next_vector_id
@@ -22,9 +24,12 @@ from services.embeddings import embed_texts
 from services.faiss_store import FaissStore
 from services.neo4j_service import Neo4jService
 from services.diff_service import make_class_diff, make_method_diff
+from services.code_chunker import chunk_source_by_lines
+
+# WorkItem modules (used by the dedicated API only)
 from services.workitem_extractor import parse_workitems_from_dir
 from services.workitem_mapper import match_workitem_to_docs
-from pathlib import Path
+
 
 class IngestRequest(BaseModel):
     repo_name: str = Field(min_length=1)
@@ -36,16 +41,27 @@ class WorkItemProcessRequest(BaseModel):
     repo_name: str = Field(min_length=1)
     threshold: float = Field(default=0.18, ge=0.0, le=1.0)
     top_k: int = Field(default=5, ge=1, le=50)
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    k: int = Field(default=12, ge=1, le=50)
+    kinds: list[str] | None = None
+    use_llm: bool = True
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _doc_id(prefix: str, repo_id: str, key: str) -> str:
     h = hashlib.sha256((prefix + ":" + repo_id + ":" + key).encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{repo_id}_{h}"
 
+
 def _diff_id(prefix: str, left_proj: str, right_proj: str, key: str) -> str:
     h = hashlib.sha256((prefix + ":" + left_proj + ":" + right_proj + ":" + key).encode("utf-8")).hexdigest()[:16]
     return f"diff_{h}"
+
 
 def create_app() -> Flask:
     env_path = Path(__file__).resolve().parent / ".env"
@@ -279,6 +295,7 @@ def create_app() -> Flask:
                         "repo_id": repo_id,
                         "project_name": payload.repo_name,
                         "file_path": abs_fp,
+                        "text": docs["file_doc"],
                     }]
                     for m in method_dicts:
                         md_text = docs["method_docs"].get(m["signature"], "")
@@ -290,6 +307,38 @@ def create_app() -> Flask:
                             "file_path": m["file"],
                             "signature": m["signature"],
                             "method_name": m["method_name"],
+                            "text": md_text,
+                        })
+
+                    
+                    # Source code chunks (for semantic code search)
+                    try:
+                        chunk_lines = int(os.getenv("CODE_CHUNK_LINES", "220"))
+                        overlap_lines = int(os.getenv("CODE_CHUNK_OVERLAP", "30"))
+                        max_chunks = int(os.getenv("CODE_CHUNK_MAX", "12"))
+                    except Exception:
+                        chunk_lines, overlap_lines, max_chunks = 220, 30, 50
+
+                    for i, ch in enumerate(
+                        chunk_source_by_lines(
+                            file_path=abs_fp,
+                            source_text=src,
+                            chunk_lines=chunk_lines,
+                            overlap_lines=overlap_lines,
+                            max_chunks=max_chunks,
+                        ),
+                        start=1,
+                    ):
+                        texts.append(ch.text)
+                        metas.append({
+                            "kind": "source_chunk",
+                            "repo_id": repo_id,
+                            "project_name": payload.repo_name,
+                            "file_path": abs_fp,
+                            "chunk_no": i,
+                            "start_line": ch.start_line,
+                            "end_line": ch.end_line,
+                            "text": ch.text,
                         })
 
                     vecs = embed_texts(cfg.OPENAI_API_KEY, cfg.OPENAI_EMBED_MODEL, texts)
@@ -323,100 +372,197 @@ def create_app() -> Flask:
         finally:
             neo.close()
 
+    @app.post("/api/workitems/process")
+    def process_workitems():
+        try:
+            payload = WorkItemProcessRequest(**request.get_json(force=True))
+        except ValidationError as e:
+            return jsonify({"error": "invalid_payload", "details": json.loads(e.json())}), 400
 
-@app.post("/api/workitems/process")
-def process_workitems():
-    """Extract WorkItems from /workitem PDFs of a previously ingested repo and map them to existing code nodes.
+        repo = get_repo_by_name(cfg.SQLITE_PATH, payload.repo_name)
+        if not repo:
+            return jsonify({
+                "error": "repo_not_found",
+                "details": "Repo name not found in SQLite. Ingest the repo first using /api/repos/ingest.",
+                "repo_name": payload.repo_name
+            }), 400
 
-    Mapping is performed across ALL existing JavaClass/JavaMethod nodes in Neo4j (irrespective of repository).
-    """
-    try:
-        payload = WorkItemProcessRequest(**request.get_json(force=True))
-    except ValidationError as e:
-        return jsonify({"error": "invalid_payload", "details": json.loads(e.json())}), 400
+        local_path = repo.get("local_path") or ""
+        workitem_dir = str((Path(__file__).resolve().parent / "workitem").resolve())
 
-    repo = get_repo_by_name(cfg.SQLITE_PATH, payload.repo_name)
-    if not repo:
-        return jsonify({
-            "error": "repo_not_found",
-            "details": "Repo name not found in SQLite. Ingest the repo first using /api/repos/ingest.",
-            "repo_name": payload.repo_name
-        }), 400
+        if not cfg.OPENAI_API_KEY:
+            return jsonify({"error": "missing_openai_api_key", "details": "Set OPENAI_API_KEY in your .env."}), 500
 
-    local_path = repo.get("local_path") or ""
-    workitem_dir = os.path.join(local_path, "workitem")
+        # 1) Extract workitems from PDFs
+        workitems = parse_workitems_from_dir(workitem_dir)
 
-    # 1) Extract workitems from PDFs
-    workitems = parse_workitems_from_dir(workitem_dir)
+        counts = {
+            "repo_name": payload.repo_name,
+            "workitem_dir": workitem_dir,
+            "pdf_workitems_extracted": len(workitems),
+            "workitems_upserted": 0,
+            "links_created": 0,
+            "matched_class_links": 0,
+            "matched_method_links": 0,
+            "workitems_without_matches": 0,
+            "faiss_vectors_added": 0,
+        }
 
-    counts = {
-        "repo_name": payload.repo_name,
-        "workitem_dir": workitem_dir,
-        "pdf_workitems_extracted": len(workitems),
-        "workitems_upserted": 0,
-        "links_created": 0,
-        "matched_class_links": 0,
-        "matched_method_links": 0,
-        "workitems_without_matches": 0,
-    }
+        neo = Neo4jService(cfg.NEO4J_URI, cfg.NEO4J_USER, cfg.NEO4J_PASSWORD)
+        try:
+            neo.ensure_constraints()
 
-    neo = Neo4jService(cfg.NEO4J_URI, cfg.NEO4J_USER, cfg.NEO4J_PASSWORD)
-    try:
-        neo.ensure_constraints()
+            # Repository-agnostic: fetch docs across ALL repositories/projects
+            class_docs = neo.get_all_class_docs()
+            method_docs = neo.get_all_method_docs()
 
-        class_docs = neo.get_all_class_docs()
-        method_docs = neo.get_all_method_docs()
+            # Also store WorkItem details in FAISS for natural-language search
+            probe_vec = embed_texts(cfg.OPENAI_API_KEY, cfg.OPENAI_EMBED_MODEL, ["probe"])[0]
+            faiss_store = FaissStore(cfg.FAISS_INDEX_PATH, cfg.FAISS_META_PATH, dim=len(probe_vec))
 
-        for wi in workitems:
-            wid = neo.upsert_workitem({
-                "key": wi.key,
-                "title": wi.title,
-                "description": wi.description,
-                "acceptance_criteria": wi.acceptance_criteria,
-                "source_pdf": wi.source_pdf,
-            })
-            counts["workitems_upserted"] += 1
+            wi_texts = []
+            wi_metas = []
+            for wi in workitems:
+                wi_text = (
+                    f"Kind: workitem\n"
+                    f"Key: {wi.key}\n"
+                    f"Title: {wi.title}\n\n"
+                    f"Description:\n{wi.description}\n\n"
+                    f"Acceptance Criteria:\n{wi.acceptance_criteria}"
+                )
+                wi_texts.append(wi_text)
+                wi_metas.append({
+                    "kind": "workitem",
+                    "key": wi.key,
+                    "title": wi.title,
+                    "source_pdf": wi.source_pdf,
+                    "text": wi_text,
+                })
 
-            matches = match_workitem_to_docs(
-                wi,
-                class_docs=class_docs,
-                method_docs=method_docs,
-                threshold=float(payload.threshold),
-                top_k=int(payload.top_k),
+            if wi_texts:
+                wi_vecs = embed_texts(cfg.OPENAI_API_KEY, cfg.OPENAI_EMBED_MODEL, wi_texts)
+                for vec, meta in zip(wi_vecs, wi_metas):
+                    vid = next_vector_id(cfg.SQLITE_PATH)
+                    faiss_store.add(vid, vec, meta)
+                    counts["faiss_vectors_added"] += 1
+                faiss_store.persist()
+
+            for wi in workitems:
+                wid = neo.upsert_workitem({
+                    "key": wi.key,
+                    "title": wi.title,
+                    "description": wi.description,
+                    "acceptance_criteria": wi.acceptance_criteria,
+                    "source_pdf": wi.source_pdf,
+                })
+                counts["workitems_upserted"] += 1
+
+                matches = match_workitem_to_docs(
+                    wi,
+                    class_docs=class_docs,
+                    method_docs=method_docs,
+                    threshold=float(payload.threshold),
+                    top_k=int(payload.top_k),
+                )
+
+                if not matches:
+                    counts["workitems_without_matches"] += 1
+                    continue
+
+                for m in matches:
+                    # Relationships are ONLY to JavaClass/JavaMethod nodes (never to Documentation)
+                    if m.node_type == "class":
+                        neo.link_workitem_to_class(
+                            workitem_id=wid,
+                            project_name=m.node_key.get("project_name"),
+                            package=m.node_key.get("package") or "",
+                            class_name=m.node_key.get("class_name"),
+                            score=m.score,
+                        )
+                        counts["links_created"] += 1
+                        counts["matched_class_links"] += 1
+                    elif m.node_type == "method":
+                        neo.link_workitem_to_method(
+                            workitem_id=wid,
+                            project_name=m.node_key.get("project_name"),
+                            class_name=m.node_key.get("class_name"),
+                            signature=m.node_key.get("signature"),
+                            score=m.score,
+                        )
+                        counts["links_created"] += 1
+                        counts["matched_method_links"] += 1
+
+            return jsonify({"status": "completed", "counts": counts}), 200
+        finally:
+            neo.close()
+
+
+    @app.post("/api/search")
+    def search():
+        try:
+            payload = SearchRequest(**request.get_json(force=True))
+        except ValidationError as e:
+            return jsonify({"error": "invalid_payload", "details": json.loads(e.json())}), 400
+
+        if not cfg.OPENAI_API_KEY:
+            return jsonify({"error": "missing_openai_api_key", "details": "Set OPENAI_API_KEY in your .env."}), 500
+
+        # Load FAISS store (creates empty index if none exists yet)
+        probe_vec = embed_texts(cfg.OPENAI_API_KEY, cfg.OPENAI_EMBED_MODEL, ["probe"])[0]
+        faiss_store = FaissStore(cfg.FAISS_INDEX_PATH, cfg.FAISS_META_PATH, dim=len(probe_vec))
+
+        qvec = embed_texts(cfg.OPENAI_API_KEY, cfg.OPENAI_EMBED_MODEL, [payload.query])[0]
+        matches = faiss_store.search(qvec, k=int(payload.k))
+
+        if payload.kinds:
+            allow = set([k.strip() for k in payload.kinds if k and k.strip()])
+            matches = [m for m in matches if m.get("metadata", {}).get("kind") in allow]
+
+        # Build compact context for LLM formatting
+        contexts = []
+        for m in matches[: min(len(matches), 20)]:
+            md = m.get("metadata", {}) or {}
+            kind = md.get("kind", "unknown")
+            header_parts = [f"kind={kind}"]
+            for key in ("project_name", "file_path", "signature", "class_name", "key"):
+                if md.get(key):
+                    header_parts.append(f"{key}={md.get(key)}")
+            header = " | ".join(header_parts)
+
+            txt = (md.get("text") or "").strip()
+            if len(txt) > 2000:
+                txt = txt[:2000] + "..."
+            contexts.append(f"[{m.get('rank')}] {header}\n{txt}")
+
+        answer = None
+        if payload.use_llm:
+            client = OpenAI(api_key=cfg.OPENAI_API_KEY)
+            prompt = (
+                "You are a codebase assistant. Answer the user's question using ONLY the retrieved context.\n"
+                "If the context is insufficient, say what is missing and suggest what to search for next.\n"
+                "When referencing code, cite file_path and line ranges if available, or method signatures.\n\n"
+                f"User question:\n{payload.query}\n\n"
+                "Retrieved context:\n"
+                + ("\n\n".join(contexts) if contexts else "(no matches)")
             )
+            answer = client.chat.completions.create(
+                model=cfg.OPENAI_DOC_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            ).choices[0].message.content.strip()
 
-            if not matches:
-                counts["workitems_without_matches"] += 1
-                continue
+        return jsonify({
+            "query": payload.query,
+            "k": payload.k,
+            "match_count": len(matches),
+            "matches": matches,
+            "answer": answer,
+        }), 200
 
-            for m in matches:
-                if m.node_type == "class":
-                    neo.link_workitem_to_class(
-                        workitem_id=wid,
-                        project_name=m.node_key.get("project_name"),
-                        package=m.node_key.get("package") or "",
-                        class_name=m.node_key.get("class_name"),
-                        score=m.score,
-                    )
-                    counts["links_created"] += 1
-                    counts["matched_class_links"] += 1
-                elif m.node_type == "method":
-                    neo.link_workitem_to_method(
-                        workitem_id=wid,
-                        project_name=m.node_key.get("project_name"),
-                        class_name=m.node_key.get("class_name"),
-                        signature=m.node_key.get("signature"),
-                        score=m.score,
-                    )
-                    counts["links_created"] += 1
-                    counts["matched_method_links"] += 1
-
-        return jsonify({"status": "completed", "counts": counts}), 200
-    finally:
-        neo.close()
     return app
 
+
 if __name__ == "__main__":
-    app = create_app()
     cfg = Config()
+    app = create_app()
     app.run(host=cfg.HOST, port=cfg.PORT, debug=cfg.DEBUG)
